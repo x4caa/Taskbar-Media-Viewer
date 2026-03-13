@@ -1,4 +1,5 @@
 use crate::media;
+use crate::config::get_config;
 use eframe::egui;
 use std::time::Duration;
 #[cfg(target_os = "windows")]
@@ -10,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
-pub struct TaskbarGui {
+struct TaskbarGui {
     current_media: media::MediaInfo,
 }
 
@@ -20,6 +21,7 @@ impl Default for TaskbarGui {
             current_media: media::MediaInfo::new(
                 String::new(),
                 "No Active Media Session".to_string(),
+                String::new(),
                 String::new(),
             ),
         }
@@ -77,6 +79,28 @@ fn hide_overlay_from_task_switchers() {
     }
 }
 
+// Start the GUI app
+pub fn start_gui() {
+    let config = get_config().unwrap();
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_always_on_top()
+            .with_inner_size(config.size)
+            .with_position(config.position),
+
+        ..Default::default()
+    };
+
+    let _ = eframe::run_native(
+        "Taskbar Media Info",
+        options,
+        Box::new(|_cc| Ok(Box::<TaskbarGui>::default())),
+    );
+}
+
 impl eframe::App for TaskbarGui {
     // Keep the OS compositor-visible background fully transparent
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -91,14 +115,9 @@ impl eframe::App for TaskbarGui {
         pin_overlay_topmost();
 
         // Get the current prioritized media session and update the displayed info
-        let song = media::get_prioritized_media().unwrap_or_else(|| {
-            media::MediaInfo::new(
-                String::new(),
-                "No Active Media Session".to_string(),
-                String::new(),
-            )
-        });
-        self.current_media = song;
+        if let Ok(song) = media::get_prioritized_media() {
+            self.current_media = song;
+        }
 
         // Draw the UI
         let frame = egui::Frame::new().fill(egui::Color32::TRANSPARENT);

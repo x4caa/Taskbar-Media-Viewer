@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 eframe = "0.33.3"
+nowhear = "0.2.0"
+pollster = "0.4.0"
 windows = { version = "0.62.2", features = [
     "Media_Control",
     "Foundation",

@@ -1,13 +1,13 @@
 use std::sync::OnceLock;
 
 pub struct TaskbarMediaConfig {
-    pub priority_list: Vec<String>,
+    pub priority_list: Vec<(String, i32)>, // List of wildcard app identifiers with their priority scores
     pub size: [f32; 2],
     pub position: [f32; 2],
 }
 
 impl TaskbarMediaConfig {
-    pub fn new(priority_list: Vec<String>, size: [f32; 2], position: [f32; 2]) -> Self {
+    pub fn new(priority_list: Vec<(String, i32)>, size: [f32; 2], position: [f32; 2]) -> Self {
         Self { priority_list, size, position }
     }
 }
