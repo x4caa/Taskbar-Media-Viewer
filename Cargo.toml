@@ -9,8 +9,7 @@ nowhear = "0.2.0"
 pollster = "0.4.0"
 windows = { version = "0.62.2", features = [
     "Media_Control",
-    "Foundation",
-    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging"
 ]}
 windows-future = "0.3"

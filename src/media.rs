@@ -1,7 +1,10 @@
-use nowhear::{MediaSource, MediaSourceBuilder, Result};
-use nowhear::source::PlatformMediaSource;
 use crate::config::get_config;
+use nowhear::source::PlatformMediaSource;
+use nowhear::{MediaSource, MediaSourceBuilder, Result};
 use std::sync::OnceLock;
+use windows::Media::Control::{
+    GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
+};
 
 #[derive(Clone)]
 #[allow(unused)]
@@ -38,25 +41,83 @@ impl MediaInfo {
 
 static MEDIA_SOURCE: OnceLock<PlatformMediaSource> = OnceLock::new();
 
+// Gets the media session manager, which provides access to all current media sessions
+fn get_session_manager() -> windows::core::Result<GlobalSystemMediaTransportControlsSessionManager>
+{
+    pollster::block_on(GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?)
+}
+
+fn find_session_by_app_id(
+    app_id: &str,
+) -> windows::core::Result<Option<GlobalSystemMediaTransportControlsSession>> {
+    let manager = get_session_manager()?;
+    let sessions = manager.GetSessions()?;
+    let size = sessions.Size()?;
+
+    for index in 0..size {
+        let session = sessions.GetAt(index)?;
+        if session.SourceAppUserModelId()?.to_string() == app_id {
+            return Ok(Some(session));
+        }
+    }
+
+    Ok(None)
+}
+
+// Control playback for the session with the given app_id, if its playing
+pub fn pause_session(app_id: &str) -> windows::core::Result<bool> {
+    let Some(session) = find_session_by_app_id(app_id)? else {
+        return Ok(false);
+    };
+
+    pollster::block_on(session.TryPauseAsync()?)
+}
+
+// Plays the session with the given app_id, if its playing
+pub fn play_session(app_id: &str) -> windows::core::Result<bool> {
+    let Some(session) = find_session_by_app_id(app_id)? else {
+        return Ok(false);
+    };
+
+    pollster::block_on(session.TryPlayAsync()?)
+}
+
+// Skips to the next track in the session with the given app_id, if supported
+pub fn next_session(app_id: &str) -> windows::core::Result<bool> {
+    let Some(session) = find_session_by_app_id(app_id)? else {
+        return Ok(false);
+    };
+
+    pollster::block_on(session.TrySkipNextAsync()?)
+}
+
+// Skip to the previous track in the session with the given app_id, if supported
+pub fn previous_session(app_id: &str) -> windows::core::Result<bool> {
+    let Some(session) = find_session_by_app_id(app_id)? else {
+        return Ok(false);
+    };
+
+    pollster::block_on(session.TrySkipPreviousAsync()?)
+}
+
+// Gets the static media source, initializing it only once as constant building can break it
 fn get_media_source() -> Result<&'static PlatformMediaSource> {
     if let Some(source) = MEDIA_SOURCE.get() {
-        return Ok(source)
+        return Ok(source);
     }
 
     let built = pollster::block_on(MediaSourceBuilder::new().build())?;
     let _ = MEDIA_SOURCE.set(built);
 
-    Ok(MEDIA_SOURCE.get().expect("MEDIA_SOURCE should be initialized"))
+    Ok(MEDIA_SOURCE
+        .get()
+        .expect("MEDIA_SOURCE should be initialized"))
 }
 
 // Get the current media sessions and their info
 async fn get_current() -> Result<Vec<MediaInfo>> {
-    println!("Polling media sessions...");
     let source = get_media_source()?;
-    println!("Got media sessions");
-    println!("Polling players...");
     let players = source.list_players().await?;
-    println!("Found {} media players", players.len());
     let mut media_info_list: Vec<MediaInfo> = Vec::new();
 
     for player in &players {
@@ -123,7 +184,5 @@ pub fn get_prioritized_media() -> Result<MediaInfo> {
     let media_sessions = pollster::block_on(get_current())?;
     let best = media_sessions.into_iter().max_by_key(|m| m.score);
 
-    Ok(best.unwrap_or_else(|| {
-        MediaInfo::empty()
-    }))
+    Ok(best.unwrap_or_else(|| MediaInfo::empty()))
 }
