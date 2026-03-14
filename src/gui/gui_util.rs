@@ -1,6 +1,5 @@
 use eframe::egui::{self};
 use std::mem::size_of;
-use std::sync::OnceLock;
 use windows::core::{PCWSTR};
 use windows::Win32::Foundation::{HWND, POINT, RECT as WinRECT};
 use windows::Win32::Graphics::Gdi::{
@@ -14,17 +13,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
-static OVERLAY_HWND: OnceLock<isize> = OnceLock::new();
-
 fn overlay_hwnd() -> Option<HWND> {
-    if let Some(hwnd) = OVERLAY_HWND.get().copied() {
-        return Some(HWND(hwnd as *mut core::ffi::c_void));
-    }
-
     let title_utf16: Vec<u16> = "Taskbar Media Info\0".encode_utf16().collect();
-    let hwnd = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title_utf16.as_ptr())) }.ok()?;
-    let _ = OVERLAY_HWND.set(hwnd.0 as isize);
-    Some(hwnd)
+    unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title_utf16.as_ptr())) }.ok()
 }
 
 // Returns true if the OS cursor is currently over any of the given egui rects (in logical pixels).

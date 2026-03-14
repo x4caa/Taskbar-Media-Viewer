@@ -98,6 +98,7 @@ pub fn start_gui() {
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false)
             .with_transparent(true)
+            .with_taskbar(false)
             .with_always_on_top()
             .with_inner_size(config.size)
             .with_position(config.position),
@@ -231,14 +232,29 @@ impl eframe::App for TaskbarGui {
                         let play_pause_label = if self.current_media.state == "Playing" { "⏸" } else { "▶" };
                         let r = ui.add_sized([button_size, button_size], egui::Button::new(play_pause_label));
                         if r.clicked() {
-                            let result = if self.current_media.state == "Playing" {
+                            let was_playing = self.current_media.state == "Playing";
+                            let result = if was_playing {
                                 media::pause_session(&self.current_media.app_id)
                             } else {
                                 media::play_session(&self.current_media.app_id)
                             };
 
-                            if let Err(error) = result {
-                                eprintln!("Failed to change playback state: {error}");
+                            match result {
+                                Ok(true) => {
+                                    self.current_media.state = if was_playing {
+                                        "Paused".to_string()
+                                    } else {
+                                        "Playing".to_string()
+                                    };
+                                    // Ensure the icon updates immediately on this click.
+                                    ctx.request_repaint();
+                                }
+                                Ok(false) => {
+                                    eprintln!("Playback state change not supported by this session.");
+                                }
+                                Err(error) => {
+                                    eprintln!("Failed to change playback state: {error}");
+                                }
                             }
                         }
                         button_rects.push(r.rect);
@@ -287,6 +303,12 @@ impl eframe::App for TaskbarGui {
                 gui_util::cursor_over_rects(&self.interactive_rects, ctx.pixels_per_point());
             if over_interactive != self.over_interactive {
                 self.over_interactive = over_interactive;
+                if over_interactive {
+                    // Re-assert toolwindow styles right before interaction to avoid transient taskbar hover entries.
+                    gui_util::hide_overlay_from_task_switchers();
+                    gui_util::pin_overlay_topmost();
+                    self.last_style_enforce = now;
+                }
                 self.set_mouse_passthrough(ctx, !over_interactive);
             }
         }
