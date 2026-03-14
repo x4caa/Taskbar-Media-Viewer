@@ -6,7 +6,7 @@ use winreg::enums::HKEY_CURRENT_USER;
 use std::mem::size_of;
 use std::time::Duration;
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow
 };
 use windows::Win32::Foundation::{POINT, RECT as WinRECT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -155,6 +155,70 @@ fn is_dark_mode() -> Result<bool, windows::core::Error> {
     let apps_use_light_theme: u32 = personalize.get_value("AppsUseLightTheme")?;
 
     Ok(apps_use_light_theme == 0)
+}
+
+pub fn get_taskbar_position_and_size() -> Option<([f32; 2], [f32; 2])> {
+    unsafe {
+        let class_utf16: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
+        let taskbar_hwnd = FindWindowW(PCWSTR(class_utf16.as_ptr()), PCWSTR::null()).ok()?;
+
+        let mut taskbar_rect = WinRECT::default();
+        if GetWindowRect(taskbar_hwnd, &mut taskbar_rect).is_ok() {
+            let width = (taskbar_rect.right - taskbar_rect.left) as f32;
+            let height = (taskbar_rect.bottom - taskbar_rect.top) as f32;
+            if width > 0.0 && height > 0.0 {
+                return Some(([taskbar_rect.left as f32, taskbar_rect.top as f32], [width, height]));
+            }
+        }
+
+        let monitor = MonitorFromWindow(taskbar_hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.0.is_null() {
+            return None;
+        }
+
+        let mut monitor_info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+            return None;
+        }
+
+        let monitor_rect = monitor_info.rcMonitor;
+        let work_rect = monitor_info.rcWork;
+
+        let left = (work_rect.left - monitor_rect.left).max(0) as f32;
+        let top = (work_rect.top - monitor_rect.top).max(0) as f32;
+        let right = (monitor_rect.right - work_rect.right).max(0) as f32;
+        let bottom = (monitor_rect.bottom - work_rect.bottom).max(0) as f32;
+
+        if bottom > 0.0 {
+            let x = monitor_rect.left as f32;
+            let y = work_rect.bottom as f32;
+            let w = (monitor_rect.right - monitor_rect.left) as f32;
+            return Some(([x, y], [w, bottom]));
+        }
+        if top > 0.0 {
+            let x = monitor_rect.left as f32;
+            let y = monitor_rect.top as f32;
+            let w = (monitor_rect.right - monitor_rect.left) as f32;
+            return Some(([x, y], [w, top]));
+        }
+        if left > 0.0 {
+            let x = monitor_rect.left as f32;
+            let y = monitor_rect.top as f32;
+            let h = (monitor_rect.bottom - monitor_rect.top) as f32;
+            return Some(([x, y], [left, h]));
+        }
+        if right > 0.0 {
+            let x = work_rect.right as f32;
+            let y = monitor_rect.top as f32;
+            let h = (monitor_rect.bottom - monitor_rect.top) as f32;
+            return Some(([x, y], [right, h]));
+        }
+
+        None
+    }
 }
 
 // Start the GUI app

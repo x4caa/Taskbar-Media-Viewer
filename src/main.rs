@@ -17,8 +17,9 @@ async fn main() {
     priority_list.push(("music".to_string(), 30));
     priority_list.push(("chrome".to_string(), 25));
     priority_list.push(("msedge".to_string(), 25));
-    let size = [800.0, 46.0]; // TODO: Dynamically calculate this based on screen size and taskbar position
-    let position = [0.0, 1033.0]; // TODO: Dynamically calculate this based on screen size and taskbar position
+    let taskbar_position_and_size = taskbar_gui::get_taskbar_position_and_size().unwrap_or(([0.0f32, 0.0f32], [0.0f32, 0.0f32]));
+    let position = [0.0, taskbar_position_and_size.0[1]];
+    let size = [taskbar_position_and_size.1[0] * 0.25, taskbar_position_and_size.1[1]];
     let config = config::TaskbarMediaConfig::new(priority_list, size, position);
     config::init_config(config).expect("Failed to initialize app config");
 
