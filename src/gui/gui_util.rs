@@ -1,10 +1,11 @@
 use eframe::egui::{self};
 use std::mem::size_of;
+use std::sync::OnceLock;
 use windows::core::{PCWSTR};
+use windows::Win32::Foundation::{HWND, POINT, RECT as WinRECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow
 };
-use windows::Win32::Foundation::{POINT, RECT as WinRECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetForegroundWindow, GWL_EXSTYLE, GetCursorPos, GetWindowLongW, GetWindowRect,
     HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
@@ -13,11 +14,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
+static OVERLAY_HWND: OnceLock<isize> = OnceLock::new();
+
+fn overlay_hwnd() -> Option<HWND> {
+    if let Some(hwnd) = OVERLAY_HWND.get().copied() {
+        return Some(HWND(hwnd as *mut core::ffi::c_void));
+    }
+
+    let title_utf16: Vec<u16> = "Taskbar Media Info\0".encode_utf16().collect();
+    let hwnd = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title_utf16.as_ptr())) }.ok()?;
+    let _ = OVERLAY_HWND.set(hwnd.0 as isize);
+    Some(hwnd)
+}
+
 // Returns true if the OS cursor is currently over any of the given egui rects (in logical pixels).
 // Uses Win32 GetCursorPos so it works even when MousePassthrough is active.
 pub fn cursor_over_rects(rects: &[egui::Rect], pixels_per_point: f32) -> bool {
-    let title_utf16: Vec<u16> = "Taskbar Media Info\0".encode_utf16().collect();
-    let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title_utf16.as_ptr())) }) else {
+    let Some(hwnd) = overlay_hwnd() else {
         return false;
     };
     let mut cursor = POINT::default();
@@ -37,10 +50,7 @@ pub fn cursor_over_rects(rects: &[egui::Rect], pixels_per_point: f32) -> bool {
 
 // Pins an overlay window to the topmost z-order to ensure it stays above the taskbar and other windows
 pub fn pin_overlay_topmost() {
-    let title_utf16: Vec<u16> = "Taskbar Media Info\0".encode_utf16().collect();
-
-    let hwnd = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title_utf16.as_ptr())) };
-    if let Ok(hwnd) = hwnd {
+    if let Some(hwnd) = overlay_hwnd() {
         let _ = unsafe {
             SetWindowPos(
                 hwnd,
@@ -57,10 +67,7 @@ pub fn pin_overlay_topmost() {
 
 // Convert the window to a Windows tool window so it is hidden from taskbar and Alt-Tab.
 pub fn hide_overlay_from_task_switchers() {
-    let title_utf16: Vec<u16> = "Taskbar Media Info\0".encode_utf16().collect();
-    let hwnd = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title_utf16.as_ptr())) };
-
-    if let Ok(hwnd) = hwnd {
+    if let Some(hwnd) = overlay_hwnd() {
         let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
         let mut new_style = ex_style as u32;
         new_style |= WS_EX_TOOLWINDOW.0 as u32;
@@ -92,8 +99,7 @@ pub fn is_foreground_fullscreen() -> bool {
     }
 
     // Ignore our own overlay window so it doesn't pause itself.
-    let title_utf16: Vec<u16> = "Taskbar Media Info\0".encode_utf16().collect();
-    if let Ok(overlay_hwnd) = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title_utf16.as_ptr())) } {
+    if let Some(overlay_hwnd) = overlay_hwnd() {
         if foreground == overlay_hwnd {
             return false;
         }

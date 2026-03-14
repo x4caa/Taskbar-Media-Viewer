@@ -5,8 +5,16 @@ use std::time::{Duration, Instant};
 use crate::gui::gui_placement;
 use crate::gui::gui_util;
 
-// Poll the taskbar layout often enough to follow pinned app changes without redrawing constantly.
-const TASKBAR_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Poll placement aggressively for a short burst after layout changes, otherwise stay in a low-frequency idle mode.
+const TASKBAR_POLL_INTERVAL_ACTIVE: Duration = Duration::from_millis(120);
+const TASKBAR_POLL_INTERVAL_IDLE: Duration = Duration::from_millis(800);
+const TASKBAR_ACTIVE_POLL_WINDOW: Duration = Duration::from_secs(2);
+const FULLSCREEN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STYLE_ENFORCE_INTERVAL: Duration = Duration::from_secs(2);
+const THEME_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const HOVER_POLL_INTERVAL: Duration = Duration::from_millis(33);
+const REPAINT_ACTIVE_INTERVAL: Duration = Duration::from_millis(16);
+const REPAINT_IDLE_INTERVAL: Duration = Duration::from_millis(160);
 const VIEWPORT_LERP_SPEED: f32 = 14.0;
 const VIEWPORT_SNAP_EPSILON: f32 = 0.25;
 
@@ -17,6 +25,15 @@ struct TaskbarGui {
     viewport_position: [f32; 2],
     target_viewport_position: [f32; 2],
     last_taskbar_poll: Instant,
+    fast_taskbar_poll_until: Instant,
+    last_fullscreen_poll: Instant,
+    foreground_is_fullscreen: bool,
+    last_style_enforce: Instant,
+    last_theme_poll: Instant,
+    dark_mode: bool,
+    last_hover_poll: Instant,
+    over_interactive: bool,
+    mouse_passthrough_enabled: Option<bool>,
 }
 
 impl Default for TaskbarGui {
@@ -36,7 +53,25 @@ impl Default for TaskbarGui {
             viewport_size,
             viewport_position,
             target_viewport_position: viewport_position,
-            last_taskbar_poll: Instant::now() - TASKBAR_POLL_INTERVAL,
+            last_taskbar_poll: Instant::now() - TASKBAR_POLL_INTERVAL_IDLE,
+            fast_taskbar_poll_until: Instant::now(),
+            last_fullscreen_poll: Instant::now() - FULLSCREEN_POLL_INTERVAL,
+            foreground_is_fullscreen: false,
+            last_style_enforce: Instant::now() - STYLE_ENFORCE_INTERVAL,
+            last_theme_poll: Instant::now() - THEME_POLL_INTERVAL,
+            dark_mode: gui_util::is_dark_mode().unwrap_or(false),
+            last_hover_poll: Instant::now() - HOVER_POLL_INTERVAL,
+            over_interactive: false,
+            mouse_passthrough_enabled: None,
+        }
+    }
+}
+
+impl TaskbarGui {
+    fn set_mouse_passthrough(&mut self, ctx: &egui::Context, enabled: bool) {
+        if self.mouse_passthrough_enabled != Some(enabled) {
+            ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(enabled));
+            self.mouse_passthrough_enabled = Some(enabled);
         }
     }
 }
@@ -84,15 +119,25 @@ impl eframe::App for TaskbarGui {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(16));
+        let now = Instant::now();
+        let mut high_frequency_mode = now < self.fast_taskbar_poll_until;
+        let mut viewport_animating = false;
 
         // Re-measure the taskbar periodically so the overlay follows centered icons and tray changes.
-        if self.last_taskbar_poll.elapsed() >= TASKBAR_POLL_INTERVAL {
-            self.last_taskbar_poll = Instant::now();
+        let taskbar_poll_interval = if high_frequency_mode {
+            TASKBAR_POLL_INTERVAL_ACTIVE
+        } else {
+            TASKBAR_POLL_INTERVAL_IDLE
+        };
+
+        if self.last_taskbar_poll.elapsed() >= taskbar_poll_interval {
+            self.last_taskbar_poll = now;
 
             if let Some((position, size)) = gui_placement::get_taskbar_overlay_placement().or_else(gui_placement::get_taskbar_position_and_size) {
                 if placement_has_changed(self.target_viewport_position, self.viewport_size, position, size) {
                     self.target_viewport_position = position;
+                    self.fast_taskbar_poll_until = now + TASKBAR_ACTIVE_POLL_WINDOW;
+                    high_frequency_mode = true;
 
                     if (self.viewport_size[0] - size[0]).abs() > 0.5 || (self.viewport_size[1] - size[1]).abs() > 0.5 {
                         self.viewport_size = size;
@@ -121,6 +166,7 @@ impl eframe::App for TaskbarGui {
         if (next_position[0] - self.viewport_position[0]).abs() > 0.01
             || (next_position[1] - self.viewport_position[1]).abs() > 0.01
         {
+            viewport_animating = true;
             self.viewport_position = next_position;
             ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
                 self.viewport_position[0],
@@ -128,20 +174,33 @@ impl eframe::App for TaskbarGui {
             )));
         }
 
-        if gui_util::is_foreground_fullscreen() {
+        if self.last_fullscreen_poll.elapsed() >= FULLSCREEN_POLL_INTERVAL {
+            self.last_fullscreen_poll = now;
+            self.foreground_is_fullscreen = gui_util::is_foreground_fullscreen();
+        }
+
+        if self.foreground_is_fullscreen {
             self.interactive_rects.clear();
-            ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(true));
+            self.over_interactive = false;
+            self.set_mouse_passthrough(ctx, true);
+            ctx.request_repaint_after(FULLSCREEN_POLL_INTERVAL);
             return;
         }
 
-        gui_util::hide_overlay_from_task_switchers();
-        gui_util::pin_overlay_topmost();
+        if self.last_style_enforce.elapsed() >= STYLE_ENFORCE_INTERVAL {
+            self.last_style_enforce = now;
+            gui_util::hide_overlay_from_task_switchers();
+            gui_util::pin_overlay_topmost();
+        }
 
         // Refresh media details only when the media controller reports a relevant change.
         if media::take_media_update_pending() {
-            if let Ok(song) = media::get_prioritized_media() {
-                self.current_media = song;
-            }
+            self.current_media = media::get_cached_prioritized_media();
+        }
+
+        if self.last_theme_poll.elapsed() >= THEME_POLL_INTERVAL {
+            self.last_theme_poll = now;
+            self.dark_mode = gui_util::is_dark_mode().unwrap_or(self.dark_mode);
         }
 
         // Draw the UI and collect interactive widget rects
@@ -195,7 +254,7 @@ impl eframe::App for TaskbarGui {
                         button_rects.push(r.rect);
 
                         // Title and artist labels
-                        let colour = if gui_util::is_dark_mode().unwrap_or(false) {
+                        let colour = if self.dark_mode {
                             egui::Color32::WHITE
                         } else {
                             egui::Color32::BLACK
@@ -222,9 +281,21 @@ impl eframe::App for TaskbarGui {
         self.interactive_rects = rects;
 
         // Use Win32 GetCursorPos so hover detection works even when passthrough is active
-        let over_interactive = gui_util::cursor_over_rects(&self.interactive_rects, ctx.pixels_per_point());
+        if self.last_hover_poll.elapsed() >= HOVER_POLL_INTERVAL {
+            self.last_hover_poll = now;
+            let over_interactive =
+                gui_util::cursor_over_rects(&self.interactive_rects, ctx.pixels_per_point());
+            if over_interactive != self.over_interactive {
+                self.over_interactive = over_interactive;
+                self.set_mouse_passthrough(ctx, !over_interactive);
+            }
+        }
 
-        // println!("Over interactive: {}", over_interactive);
-        ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(!over_interactive));
+        let repaint_interval = if viewport_animating || high_frequency_mode {
+            REPAINT_ACTIVE_INTERVAL
+        } else {
+            REPAINT_IDLE_INTERVAL
+        };
+        ctx.request_repaint_after(repaint_interval);
     }
 }

@@ -2,7 +2,7 @@ use crate::config::get_config;
 use futures_util::StreamExt;
 use nowhear::source::PlatformMediaSource;
 use nowhear::{MediaSource, MediaSourceBuilder, Result, MediaEvent};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
@@ -43,6 +43,11 @@ impl MediaInfo {
 
 static MEDIA_SOURCE: OnceLock<PlatformMediaSource> = OnceLock::new();
 static MEDIA_UPDATE_PENDING: AtomicBool = AtomicBool::new(true);
+static LATEST_MEDIA: OnceLock<RwLock<MediaInfo>> = OnceLock::new();
+
+fn latest_media_store() -> &'static RwLock<MediaInfo> {
+    LATEST_MEDIA.get_or_init(|| RwLock::new(MediaInfo::empty()))
+}
 
 // Marks media info as stale so the GUI knows it should refresh.
 pub fn mark_media_update_pending() {
@@ -52,6 +57,13 @@ pub fn mark_media_update_pending() {
 // Returns true when an update is pending and consumes the flag.
 pub fn take_media_update_pending() -> bool {
     MEDIA_UPDATE_PENDING.swap(false, Ordering::AcqRel)
+}
+
+pub fn get_cached_prioritized_media() -> MediaInfo {
+    latest_media_store()
+        .read()
+        .map(|media| media.clone())
+        .unwrap_or_else(|_| MediaInfo::empty())
 }
 
 // Gets the media session manager, which provides access to all current media sessions
@@ -192,17 +204,29 @@ fn total_priority_score(app_id: &str, state: &str, has_track: bool) -> i32 {
     (playback_score * 1000) + (app_score * 10) + track_bonus
 }
 
-// Pick the media session with the highest priority based on the provided list
-pub fn get_prioritized_media() -> Result<MediaInfo> {
-    let media_sessions = pollster::block_on(get_current())?;
-    let best = media_sessions.into_iter().max_by_key(|m| m.score);
+async fn refresh_cached_prioritized_media() -> Result<()> {
+    let media_sessions = get_current().await?;
+    let best = media_sessions
+        .into_iter()
+        .max_by_key(|m| m.score)
+        .unwrap_or_else(MediaInfo::empty);
 
-    Ok(best.unwrap_or_else(|| MediaInfo::empty()))
+    if let Ok(mut latest) = latest_media_store().write() {
+        *latest = best;
+    }
+    mark_media_update_pending();
+
+    Ok(())
 }
 
 pub async fn media_controller() -> Result<()> {
     let source = get_media_source()?;
     let mut stream = source.event_stream().await?;
+
+    // Prime the cache once so the GUI can render data without blocking.
+    if let Err(error) = refresh_cached_prioritized_media().await {
+        eprintln!("Failed to prime media cache: {error}");
+    }
 
     while let Some(event) = stream.next().await {
         // Skip position and volume changes as the priority doesn't change.
@@ -212,7 +236,10 @@ pub async fn media_controller() -> Result<()> {
         if let MediaEvent::VolumeChanged { .. } = event {
             continue;
         }
-        mark_media_update_pending();
+
+        if let Err(error) = refresh_cached_prioritized_media().await {
+            eprintln!("Failed to refresh media cache: {error}");
+        }
     }
     
     Ok(())
