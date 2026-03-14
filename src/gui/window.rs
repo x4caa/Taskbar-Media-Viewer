@@ -171,9 +171,12 @@ impl eframe::App for TaskbarGui {
                             .strong()
                             .size(14.0)
                             .color(colour);
-                        ui.vertical(|ui| {
-                            ui.add(egui::Label::new(title_text).truncate());
-                            ui.add(egui::Label::new(artist_text).truncate());
+                        ui.add_sized([ui.available_width(), button_size], |ui: &mut egui::Ui| {
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.add(egui::Label::new(title_text).truncate());
+                                ui.add(egui::Label::new(artist_text).truncate());
+                            })
+                            .response
                         });
                     });
                 });
