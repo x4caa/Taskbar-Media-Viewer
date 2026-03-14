@@ -1,6 +1,6 @@
 mod media;
 mod config;
-mod taskbar_gui;
+mod gui;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -17,9 +17,9 @@ async fn main() {
     priority_list.push(("music".to_string(), 30));
     priority_list.push(("chrome".to_string(), 25));
     priority_list.push(("msedge".to_string(), 25));
-    let taskbar_position_and_size = taskbar_gui::get_taskbar_position_and_size().unwrap_or(([0.0f32, 0.0f32], [0.0f32, 0.0f32]));
-    let position = [0.0, taskbar_position_and_size.0[1]];
-    let size = [taskbar_position_and_size.1[0] * 0.25, taskbar_position_and_size.1[1]];
+    let (position, size) = gui::get_taskbar_overlay_placement()
+        .or_else(gui::get_taskbar_position_and_size)
+        .unwrap_or(([0.0f32, 0.0f32], [420.0f32, 48.0f32]));
     let config = config::TaskbarMediaConfig::new(priority_list, size, position);
     config::init_config(config).expect("Failed to initialize app config");
 
@@ -30,5 +30,5 @@ async fn main() {
         }
     });
 
-    taskbar_gui::start_gui();
+    gui::start_gui();
 }
