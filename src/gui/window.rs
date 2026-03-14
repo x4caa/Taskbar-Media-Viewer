@@ -6,13 +6,16 @@ use crate::gui::gui_placement;
 use crate::gui::gui_util;
 
 // Poll the taskbar layout often enough to follow pinned app changes without redrawing constantly.
-const TASKBAR_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const TASKBAR_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const VIEWPORT_LERP_SPEED: f32 = 14.0;
+const VIEWPORT_SNAP_EPSILON: f32 = 0.25;
 
 struct TaskbarGui {
     current_media: media::MediaInfo,
     interactive_rects: Vec<egui::Rect>,
     viewport_size: [f32; 2],
     viewport_position: [f32; 2],
+    target_viewport_position: [f32; 2],
     last_taskbar_poll: Instant,
 }
 
@@ -32,6 +35,7 @@ impl Default for TaskbarGui {
             interactive_rects: Vec::new(),
             viewport_size,
             viewport_position,
+            target_viewport_position: viewport_position,
             last_taskbar_poll: Instant::now() - TASKBAR_POLL_INTERVAL,
         }
     }
@@ -45,6 +49,10 @@ fn placement_has_changed(position: [f32; 2], size: [f32; 2], new_position: [f32;
         || (position[1] - new_position[1]).abs() > EPSILON
         || (size[0] - new_size[0]).abs() > EPSILON
         || (size[1] - new_size[1]).abs() > EPSILON
+}
+
+fn lerp(current: f32, target: f32, alpha: f32) -> f32 {
+    current + (target - current) * alpha
 }
 
 // Start the GUI app
@@ -76,20 +84,48 @@ impl eframe::App for TaskbarGui {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(50));
+        ctx.request_repaint_after(Duration::from_millis(16));
 
         // Re-measure the taskbar periodically so the overlay follows centered icons and tray changes.
         if self.last_taskbar_poll.elapsed() >= TASKBAR_POLL_INTERVAL {
             self.last_taskbar_poll = Instant::now();
 
             if let Some((position, size)) = gui_placement::get_taskbar_overlay_placement().or_else(gui_placement::get_taskbar_position_and_size) {
-                if placement_has_changed(self.viewport_position, self.viewport_size, position, size) {
-                    self.viewport_position = position;
-                    self.viewport_size = size;
-                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(position[0], position[1])));
-                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(size[0], size[1])));
+                if placement_has_changed(self.target_viewport_position, self.viewport_size, position, size) {
+                    self.target_viewport_position = position;
+
+                    if (self.viewport_size[0] - size[0]).abs() > 0.5 || (self.viewport_size[1] - size[1]).abs() > 0.5 {
+                        self.viewport_size = size;
+                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(size[0], size[1])));
+                    }
                 }
             }
+        }
+
+        // Smoothly animate the viewport toward the latest taskbar position.
+        let dt = ctx.input(|i| i.stable_dt).max(1.0 / 240.0);
+        let alpha = 1.0 - (-VIEWPORT_LERP_SPEED * dt).exp();
+
+        let mut next_position = [
+            lerp(self.viewport_position[0], self.target_viewport_position[0], alpha),
+            lerp(self.viewport_position[1], self.target_viewport_position[1], alpha),
+        ];
+
+        if (next_position[0] - self.target_viewport_position[0]).abs() <= VIEWPORT_SNAP_EPSILON {
+            next_position[0] = self.target_viewport_position[0];
+        }
+        if (next_position[1] - self.target_viewport_position[1]).abs() <= VIEWPORT_SNAP_EPSILON {
+            next_position[1] = self.target_viewport_position[1];
+        }
+
+        if (next_position[0] - self.viewport_position[0]).abs() > 0.01
+            || (next_position[1] - self.viewport_position[1]).abs() > 0.01
+        {
+            self.viewport_position = next_position;
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
+                self.viewport_position[0],
+                self.viewport_position[1],
+            )));
         }
 
         if gui_util::is_foreground_fullscreen() {
