@@ -197,9 +197,11 @@ impl eframe::App for TaskbarGui {
         hide_overlay_from_task_switchers();
         pin_overlay_topmost();
 
-        // Get the current prioritized media session and update the displayed info
-        if let Ok(song) = media::get_prioritized_media() {
-            self.current_media = song;
+        // Refresh media details only when the media controller reports a relevant change.
+        if media::take_media_update_pending() {
+            if let Ok(song) = media::get_prioritized_media() {
+                self.current_media = song;
+            }
         }
 
         // Draw the UI and collect interactive widget rects

@@ -1,7 +1,9 @@
 use crate::config::get_config;
+use futures_util::StreamExt;
 use nowhear::source::PlatformMediaSource;
-use nowhear::{MediaSource, MediaSourceBuilder, Result};
+use nowhear::{MediaSource, MediaSourceBuilder, Result, MediaEvent};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
 };
@@ -40,6 +42,17 @@ impl MediaInfo {
 }
 
 static MEDIA_SOURCE: OnceLock<PlatformMediaSource> = OnceLock::new();
+static MEDIA_UPDATE_PENDING: AtomicBool = AtomicBool::new(true);
+
+// Marks media info as stale so the GUI knows it should refresh.
+pub fn mark_media_update_pending() {
+    MEDIA_UPDATE_PENDING.store(true, Ordering::Release);
+}
+
+// Returns true when an update is pending and consumes the flag.
+pub fn take_media_update_pending() -> bool {
+    MEDIA_UPDATE_PENDING.swap(false, Ordering::AcqRel)
+}
 
 // Gets the media session manager, which provides access to all current media sessions
 fn get_session_manager() -> windows::core::Result<GlobalSystemMediaTransportControlsSessionManager>
@@ -185,4 +198,22 @@ pub fn get_prioritized_media() -> Result<MediaInfo> {
     let best = media_sessions.into_iter().max_by_key(|m| m.score);
 
     Ok(best.unwrap_or_else(|| MediaInfo::empty()))
+}
+
+pub async fn media_controller() -> Result<()> {
+    let source = get_media_source()?;
+    let mut stream = source.event_stream().await?;
+
+    while let Some(event) = stream.next().await {
+        // Skip position and volume changes as the priority doesn't change.
+        if let MediaEvent::PositionChanged { .. } = event {
+            continue;
+        }
+        if let MediaEvent::VolumeChanged { .. } = event {
+            continue;
+        }
+        mark_media_update_pending();
+    }
+    
+    Ok(())
 }

@@ -2,7 +2,8 @@ mod media;
 mod config;
 mod taskbar_gui;
 
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     #[cfg(not(target_os = "windows"))]
     {
         eprintln!("This application is only supported on Windows.");
@@ -20,6 +21,13 @@ fn main() {
     let position = [0.0, 1033.0]; // TODO: Dynamically calculate this based on screen size and taskbar position
     let config = config::TaskbarMediaConfig::new(priority_list, size, position);
     config::init_config(config).expect("Failed to initialize app config");
+
+    // Listen for media events in the background while the GUI is running.
+    tokio::spawn(async {
+        if let Err(error) = media::media_controller().await {
+            eprintln!("Media controller error: {error}");
+        }
+    });
 
     taskbar_gui::start_gui();
 }

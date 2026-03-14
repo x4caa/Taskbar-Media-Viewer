@@ -2896,8 +2896,10 @@ name = "taskbar_media"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "futures-util",
  "nowhear",
  "pollster",
+ "tokio",
  "windows 0.62.2",
  "windows-future 0.3.2",
  "winreg",
