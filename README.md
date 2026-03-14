@@ -86,11 +86,8 @@ Each media session gets a score:
 
 The highest score wins and is shown in the overlay.
 
-## Known limitations
-
-- Layout position is currently hardcoded in `src/main.rs`
-- Multi-monitor and taskbar-position awareness is not implemented
-- Some players may expose limited transport controls depending on app support
+## TODO
+- Add auto-updating using github releases
 
 ## Project structure
 
