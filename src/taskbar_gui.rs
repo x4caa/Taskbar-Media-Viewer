@@ -1,6 +1,8 @@
 use crate::config::get_config;
 use crate::media;
 use eframe::egui::{self, ViewportCommand};
+use winreg::RegKey;
+use winreg::enums::HKEY_CURRENT_USER;
 use std::mem::size_of;
 use std::time::Duration;
 use windows::Win32::Graphics::Gdi::{
@@ -146,6 +148,15 @@ fn is_foreground_fullscreen() -> bool {
         && (win_rect.bottom - monitor_rect.bottom).abs() <= tolerance
 }
 
+// Returns true if the user has dark mode enabled in Windows settings. Used to adjust text color for better visibility.
+fn is_dark_mode() -> Result<bool, windows::core::Error> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let personalize = hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")?;
+    let apps_use_light_theme: u32 = personalize.get_value("AppsUseLightTheme")?;
+
+    Ok(apps_use_light_theme == 0)
+}
+
 // Start the GUI app
 pub fn start_gui() {
     let config = get_config().unwrap();
@@ -242,12 +253,18 @@ impl eframe::App for TaskbarGui {
                         button_rects.push(r.rect);
 
                         // Title and artist labels
+                        let colour = if is_dark_mode().unwrap_or(false) {
+                            egui::Color32::WHITE
+                        } else {
+                            egui::Color32::BLACK
+                        };
                         let title_text = egui::RichText::new(self.current_media.title.clone())
                             .size(18.0)
-                            .color(egui::Color32::WHITE);
+                            .color(colour);
                         let artist_text = egui::RichText::new(self.current_media.artist.clone())
+                            .strong()
                             .size(14.0)
-                            .color(egui::Color32::WHITE);
+                            .color(colour);
                         ui.vertical(|ui| {
                             ui.add(egui::Label::new(title_text).truncate());
                             ui.add(egui::Label::new(artist_text).truncate());
