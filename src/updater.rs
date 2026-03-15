@@ -35,6 +35,7 @@ pub fn update_app() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .repo_name("Taskbar-Media-Viewer")
         .bin_name("taskbar_media_viewer")
         .show_download_progress(true)
+        .no_confirm(true)
         .current_version(cargo_crate_version!())
         .build()?
         .update()?;

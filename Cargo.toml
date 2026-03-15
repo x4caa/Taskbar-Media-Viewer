@@ -1,6 +1,6 @@
 [package]
 name = "taskbar_media_viewer"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 
 [dependencies]
@@ -20,3 +20,4 @@ windows = { version = "0.62.2", features = [
 windows-future = "0.3"
 winreg = "0.55.0"
 self_update = { version = "0.40", features = ["archive-tar", "archive-zip", "compression-flate2", "rustls"], default-features = false }
+zip = { version = "0.6", features = ["deflate"] }
