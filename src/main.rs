@@ -1,6 +1,7 @@
 mod media;
 mod config;
 mod gui;
+mod updater;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -8,6 +9,17 @@ async fn main() {
     {
         eprintln!("This application is only supported on Windows.");
         std::process::exit(1);
+    }
+    
+    let args: Vec<String> = std::env::args().collect();
+    println!("Starting with args: {:?}", args);
+
+    if updater::should_check_for_updates() || args.contains(&"--update".to_string()) {
+        match tokio::task::spawn_blocking(updater::update_app).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("Update check failed: {error}"),
+            Err(join_error) => eprintln!("Update task failed to run: {join_error}"),
+        }
     }
 
     // Build config on startup
