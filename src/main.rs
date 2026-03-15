@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 mod media;
 mod config;
 mod gui;

@@ -86,9 +86,6 @@ Each media session gets a score:
 
 The highest score wins and is shown in the overlay.
 
-## TODO
-- Add auto-updating using github releases
-
 ## Project structure
 
 - `src/main.rs` - startup and initial config
