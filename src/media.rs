@@ -1,14 +1,18 @@
 use crate::config::get_config;
+use crate::fallback::{self, MediaCommand};
+use crate::service_recovery;
 use futures_util::StreamExt;
 use nowhear::source::PlatformMediaSource;
 use nowhear::{MediaSource, MediaSourceBuilder, Result, MediaEvent};
 use std::sync::{OnceLock, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
 };
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 #[allow(unused)]
 pub struct MediaInfo {
     pub app_id: String,
@@ -41,9 +45,27 @@ impl MediaInfo {
     }
 }
 
-static MEDIA_SOURCE: OnceLock<PlatformMediaSource> = OnceLock::new();
 static MEDIA_UPDATE_PENDING: AtomicBool = AtomicBool::new(true);
 static LATEST_MEDIA: OnceLock<RwLock<MediaInfo>> = OnceLock::new();
+// True while the Windows media session service is answering; the fallback detector takes over otherwise.
+static SESSION_SERVICE_HEALTHY: AtomicBool = AtomicBool::new(false);
+
+const CONTROLLER_RETRY_DELAY: Duration = Duration::from_secs(5);
+const SESSION_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+// The event stream goes quiet if the service hangs, so query it periodically to notice.
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+// How long the service must stay unresponsive before it is restarted.
+const SERVICE_HANG_THRESHOLD: Duration = Duration::from_secs(30);
+// Windows only restarts the service automatically a couple of times a day, so restart it sparingly.
+const SERVICE_RESTART_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+// Why the connection to the session service ended, so only a hung service gets restarted.
+enum ControllerError {
+    // The service isn't answering, which restarting it fixes.
+    Unresponsive(String),
+    // Anything else, such as one session failing to report its info, which only needs a reconnect.
+    Failed(String),
+}
 
 fn latest_media_store() -> &'static RwLock<MediaInfo> {
     LATEST_MEDIA.get_or_init(|| RwLock::new(MediaInfo::empty()))
@@ -64,6 +86,21 @@ pub fn get_cached_prioritized_media() -> MediaInfo {
         .read()
         .map(|media| media.clone())
         .unwrap_or_else(|_| MediaInfo::empty())
+}
+
+pub fn session_service_healthy() -> bool {
+    SESSION_SERVICE_HEALTHY.load(Ordering::Acquire)
+}
+
+// Stores media found by the fallback detector, unless the session service has recovered in the meantime.
+pub fn store_fallback_media(info: MediaInfo) {
+    if let Ok(mut latest) = latest_media_store().write() {
+        if session_service_healthy() || *latest == info {
+            return;
+        }
+        *latest = info;
+    }
+    mark_media_update_pending();
 }
 
 // Gets the media session manager, which provides access to all current media sessions
@@ -91,6 +128,10 @@ fn find_session_by_app_id(
 
 // Control playback for the session with the given app_id, if its playing
 pub fn pause_session(app_id: &str) -> windows::core::Result<bool> {
+    if fallback::is_fallback_app(app_id) {
+        return fallback::send_media_command(app_id, MediaCommand::PlayPause);
+    }
+
     let Some(session) = find_session_by_app_id(app_id)? else {
         return Ok(false);
     };
@@ -100,6 +141,10 @@ pub fn pause_session(app_id: &str) -> windows::core::Result<bool> {
 
 // Plays the session with the given app_id, if its playing
 pub fn play_session(app_id: &str) -> windows::core::Result<bool> {
+    if fallback::is_fallback_app(app_id) {
+        return fallback::send_media_command(app_id, MediaCommand::PlayPause);
+    }
+
     let Some(session) = find_session_by_app_id(app_id)? else {
         return Ok(false);
     };
@@ -109,6 +154,10 @@ pub fn play_session(app_id: &str) -> windows::core::Result<bool> {
 
 // Skips to the next track in the session with the given app_id, if supported
 pub fn next_session(app_id: &str) -> windows::core::Result<bool> {
+    if fallback::is_fallback_app(app_id) {
+        return fallback::send_media_command(app_id, MediaCommand::NextTrack);
+    }
+
     let Some(session) = find_session_by_app_id(app_id)? else {
         return Ok(false);
     };
@@ -118,6 +167,10 @@ pub fn next_session(app_id: &str) -> windows::core::Result<bool> {
 
 // Skip to the previous track in the session with the given app_id, if supported
 pub fn previous_session(app_id: &str) -> windows::core::Result<bool> {
+    if fallback::is_fallback_app(app_id) {
+        return fallback::send_media_command(app_id, MediaCommand::PreviousTrack);
+    }
+
     let Some(session) = find_session_by_app_id(app_id)? else {
         return Ok(false);
     };
@@ -125,23 +178,14 @@ pub fn previous_session(app_id: &str) -> windows::core::Result<bool> {
     pollster::block_on(session.TrySkipPreviousAsync()?)
 }
 
-// Gets the static media source, initializing it only once as constant building can break it
-fn get_media_source() -> Result<&'static PlatformMediaSource> {
-    if let Some(source) = MEDIA_SOURCE.get() {
-        return Ok(source);
-    }
-
-    let built = pollster::block_on(MediaSourceBuilder::new().build())?;
-    let _ = MEDIA_SOURCE.set(built);
-
-    Ok(MEDIA_SOURCE
-        .get()
-        .expect("MEDIA_SOURCE should be initialized"))
+// Connects to the media session service. Built once per connection, since the source is tied to the
+// service process it connected to and stops working if that process is restarted.
+fn build_media_source() -> Result<PlatformMediaSource> {
+    pollster::block_on(MediaSourceBuilder::new().build())
 }
 
 // Get the current media sessions and their info
-async fn get_current() -> Result<Vec<MediaInfo>> {
-    let source = get_media_source()?;
+async fn get_current(source: &PlatformMediaSource) -> Result<Vec<MediaInfo>> {
     let players = source.list_players().await?;
     let mut media_info_list: Vec<MediaInfo> = Vec::new();
 
@@ -204,14 +248,19 @@ fn total_priority_score(app_id: &str, state: &str, has_track: bool) -> i32 {
     (playback_score * 1000) + (app_score * 10) + track_bonus
 }
 
-async fn refresh_cached_prioritized_media() -> Result<()> {
-    let media_sessions = get_current().await?;
+async fn refresh_cached_prioritized_media(source: &PlatformMediaSource) -> std::result::Result<(), ControllerError> {
+    let media_sessions = tokio::time::timeout(SESSION_QUERY_TIMEOUT, get_current(source))
+        .await
+        .map_err(|_| ControllerError::Unresponsive("Timed out querying media sessions".to_string()))?
+        .map_err(|error| ControllerError::Failed(error.to_string()))?;
     let best = media_sessions
         .into_iter()
         .max_by_key(|m| m.score)
         .unwrap_or_else(MediaInfo::empty);
 
+    // Mark healthy under the lock so a fallback result can't overwrite this one.
     if let Ok(mut latest) = latest_media_store().write() {
+        SESSION_SERVICE_HEALTHY.store(true, Ordering::Release);
         *latest = best;
     }
     mark_media_update_pending();
@@ -219,28 +268,96 @@ async fn refresh_cached_prioritized_media() -> Result<()> {
     Ok(())
 }
 
-pub async fn media_controller() -> Result<()> {
-    let source = get_media_source()?;
-    let mut stream = source.event_stream().await?;
+// Listens for media events until the connection to the session service fails.
+async fn media_controller(source: &PlatformMediaSource) -> ControllerError {
+    let mut stream = match source.event_stream().await {
+        Ok(stream) => stream,
+        Err(error) => return ControllerError::Failed(error.to_string()),
+    };
 
     // Prime the cache once so the GUI can render data without blocking.
-    if let Err(error) = refresh_cached_prioritized_media().await {
-        eprintln!("Failed to prime media cache: {error}");
+    if let Err(error) = refresh_cached_prioritized_media(source).await {
+        return error;
     }
 
-    while let Some(event) = stream.next().await {
-        // Skip position and volume changes as the priority doesn't change.
-        if let MediaEvent::PositionChanged { .. } = event {
-            continue;
-        }
-        if let MediaEvent::VolumeChanged { .. } = event {
-            continue;
+    let mut health_check = tokio::time::interval(HEALTH_CHECK_INTERVAL);
+    health_check.reset();
+
+    loop {
+        tokio::select! {
+            event = stream.next() => {
+                let Some(event) = event else {
+                    return ControllerError::Failed("Media event stream ended".to_string());
+                };
+
+                // Skip position and volume changes as the priority doesn't change.
+                if let MediaEvent::PositionChanged { .. } = event {
+                    continue;
+                }
+                if let MediaEvent::VolumeChanged { .. } = event {
+                    continue;
+                }
+            }
+            _ = health_check.tick() => {}
         }
 
-        if let Err(error) = refresh_cached_prioritized_media().await {
-            eprintln!("Failed to refresh media cache: {error}");
+        if let Err(error) = refresh_cached_prioritized_media(source).await {
+            return error;
         }
     }
-    
-    Ok(())
+}
+
+// Runs the media controller forever, reconnecting if the session service fails and restarting the service if it hangs.
+pub async fn run_media_controller() {
+    let mut pending_build: Option<JoinHandle<Result<PlatformMediaSource>>> = None;
+    let mut unresponsive_since: Option<Instant> = None;
+    let mut last_service_restart: Option<Instant> = None;
+
+    loop {
+        let build = pending_build.get_or_insert_with(|| tokio::task::spawn_blocking(build_media_source));
+
+        // Connecting blocks until the service answers, which can be forever if it is hung.
+        let error = match tokio::time::timeout(SESSION_QUERY_TIMEOUT, build).await {
+            // Keep waiting on the same attempt rather than piling up new ones against a hung service.
+            Err(_) => ControllerError::Unresponsive("Timed out connecting to media session service".to_string()),
+            Ok(joined) => {
+                pending_build = None;
+                match joined {
+                    Ok(Ok(source)) => media_controller(&source).await,
+                    Ok(Err(error)) => ControllerError::Unresponsive(error.to_string()),
+                    Err(join_error) => ControllerError::Failed(join_error.to_string()),
+                }
+            }
+        };
+
+        SESSION_SERVICE_HEALTHY.store(false, Ordering::Release);
+        match &error {
+            ControllerError::Unresponsive(message) => {
+                eprintln!("Media session service unresponsive: {message}");
+                unresponsive_since.get_or_insert_with(Instant::now);
+            }
+            ControllerError::Failed(message) => {
+                eprintln!("Media controller error: {message}");
+                unresponsive_since = None;
+            }
+        }
+
+        let hung = unresponsive_since.is_some_and(|since| since.elapsed() >= SERVICE_HANG_THRESHOLD);
+        let cooled_down = last_service_restart.is_none_or(|at| at.elapsed() >= SERVICE_RESTART_COOLDOWN);
+        if hung && cooled_down {
+            last_service_restart = Some(Instant::now());
+            unresponsive_since = None;
+            match tokio::task::spawn_blocking(service_recovery::restart_media_service).await {
+                Ok(Ok(())) => {
+                    eprintln!("Restarted hung media session service");
+                    // The stuck connection attempt belongs to the old service process, so start fresh.
+                    pending_build = None;
+                }
+                Ok(Err(error)) => eprintln!("Failed to restart media session service: {error}"),
+                Err(join_error) => eprintln!("Media session service restart task failed: {join_error}"),
+            }
+        }
+
+        tokio::time::sleep(CONTROLLER_RETRY_DELAY).await;
+    }
 }

@@ -2,6 +2,8 @@
 
 mod media;
 mod config;
+mod fallback;
+mod service_recovery;
 mod gui;
 mod updater;
 
@@ -38,11 +40,9 @@ async fn main() {
     config::init_config(config).expect("Failed to initialize app config");
 
     // Listen for media events in the background while the GUI is running.
-    tokio::spawn(async {
-        if let Err(error) = media::media_controller().await {
-            eprintln!("Media controller error: {error}");
-        }
-    });
+    tokio::spawn(media::run_media_controller());
+    // Detect media another way whenever the Windows media session service is unavailable.
+    fallback::start_fallback_thread();
 
     gui::start_gui();
 }
