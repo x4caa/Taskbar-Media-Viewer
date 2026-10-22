@@ -1,14 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod media;
+mod power;
 mod config;
 mod fallback;
 mod service_recovery;
 mod gui;
 mod updater;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
+fn main() {
     #[cfg(not(target_os = "windows"))]
     {
         eprintln!("This application is only supported on Windows.");
@@ -18,12 +18,18 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     println!("Starting with args: {:?}", args);
 
-    if updater::should_check_for_updates() || args.contains(&"--update".to_string()) {
-        match tokio::task::spawn_blocking(updater::update_app).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => eprintln!("Update check failed: {error}"),
-            Err(join_error) => eprintln!("Update task failed to run: {join_error}"),
+    if args.contains(&"--update-only".to_string()) {
+        if let Err(error) = updater::update_app() {
+            eprintln!("Update check failed: {error}");
         }
+        return;
+    }
+
+    power::enable_efficiency_mode();
+    updater::remove_replaced_executables();
+    let skip_update = args.contains(&"--no-update".to_string());
+    if !skip_update && (updater::should_check_for_updates() || args.contains(&"--update".to_string())) {
+        updater::spawn_update_check();
     }
 
     // Build config on startup
@@ -39,8 +45,15 @@ async fn main() {
     let config = config::TaskbarMediaConfig::new(priority_list, size, position);
     config::init_config(config).expect("Failed to initialize app config");
 
-    // Listen for media events in the background while the GUI is running.
-    tokio::spawn(media::run_media_controller());
+    // Listen for media events in the background while the GUI is running. A single-threaded runtime is plenty for
+    // one listener, where the default runtime would start a worker thread per CPU core.
+    std::thread::spawn(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("Failed to start the media runtime");
+        runtime.block_on(media::run_media_controller());
+    });
     // Detect media another way whenever the Windows media session service is unavailable.
     fallback::start_fallback_thread();
 

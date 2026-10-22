@@ -2,6 +2,8 @@
 // Uses audio sessions to find which apps are making sound, then reads track info from window and browser tab titles.
 use crate::media::{self, MediaInfo};
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+use std::thread::Thread;
 use std::time::{Duration, Instant};
 use windows::core::{BOOL, Interface, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
@@ -27,6 +29,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 pub const FALLBACK_APP_PREFIX: &str = "fallback:";
+
+static FALLBACK_THREAD: OnceLock<Thread> = OnceLock::new();
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 // Keep reporting playback through short silences such as quiet passages or pauses in speech.
@@ -57,9 +61,16 @@ pub fn is_fallback_app(app_id: &str) -> bool {
     app_id.starts_with(FALLBACK_APP_PREFIX)
 }
 
+// Wakes the fallback detector after the media session service stops answering.
+pub fn wake() {
+    if let Some(thread) = FALLBACK_THREAD.get() {
+        thread.unpark();
+    }
+}
+
 // Polls for playing media on a dedicated thread whenever the media session service is unavailable.
 pub fn start_fallback_thread() {
-    std::thread::spawn(|| {
+    let handle = std::thread::spawn(|| {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
@@ -72,6 +83,8 @@ pub fn start_fallback_thread() {
             std::thread::sleep(POLL_INTERVAL);
             if media::session_service_healthy() {
                 last_media = None;
+                // Sleep until the service fails. An unpark that lands before this still wakes it straight away.
+                std::thread::park();
                 continue;
             }
 
@@ -102,6 +115,7 @@ pub fn start_fallback_thread() {
             media::store_fallback_media(info);
         }
     });
+    let _ = FALLBACK_THREAD.set(handle.thread().clone());
 }
 
 fn detect_playing_media(windows: &[AppWindow], automation: Option<&IUIAutomation>) -> Option<MediaInfo> {

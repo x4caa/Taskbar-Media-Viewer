@@ -4,7 +4,7 @@ use crate::service_recovery;
 use futures_util::StreamExt;
 use nowhear::source::PlatformMediaSource;
 use nowhear::{MediaSource, MediaSourceBuilder, Result, MediaEvent};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -46,9 +46,12 @@ impl MediaInfo {
 }
 
 static MEDIA_UPDATE_PENDING: AtomicBool = AtomicBool::new(true);
+static UPDATE_NOTIFIER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 static LATEST_MEDIA: OnceLock<RwLock<MediaInfo>> = OnceLock::new();
 // True while the Windows media session service is answering; the fallback detector takes over otherwise.
 static SESSION_SERVICE_HEALTHY: AtomicBool = AtomicBool::new(false);
+// Reused across button clicks, and dropped when it stops working because the service restarted.
+static SESSION_MANAGER: Mutex<Option<GlobalSystemMediaTransportControlsSessionManager>> = Mutex::new(None);
 
 const CONTROLLER_RETRY_DELAY: Duration = Duration::from_secs(5);
 const SESSION_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -71,9 +74,17 @@ fn latest_media_store() -> &'static RwLock<MediaInfo> {
     LATEST_MEDIA.get_or_init(|| RwLock::new(MediaInfo::empty()))
 }
 
-// Marks media info as stale so the GUI knows it should refresh.
+// Registers a callback that wakes the GUI whenever the media info changes.
+pub fn set_update_notifier(notifier: impl Fn() + Send + Sync + 'static) {
+    let _ = UPDATE_NOTIFIER.set(Box::new(notifier));
+}
+
+// Marks media info as stale and wakes the GUI so it refreshes.
 pub fn mark_media_update_pending() {
     MEDIA_UPDATE_PENDING.store(true, Ordering::Release);
+    if let Some(notifier) = UPDATE_NOTIFIER.get() {
+        notifier();
+    }
 }
 
 // Returns true when an update is pending and consumes the flag.
@@ -106,13 +117,32 @@ pub fn store_fallback_media(info: MediaInfo) {
 // Gets the media session manager, which provides access to all current media sessions
 fn get_session_manager() -> windows::core::Result<GlobalSystemMediaTransportControlsSessionManager>
 {
-    pollster::block_on(GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?)
+    let mut cached = SESSION_MANAGER.lock().unwrap();
+    if let Some(manager) = cached.as_ref() {
+        return Ok(manager.clone());
+    }
+    let manager = pollster::block_on(GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?)?;
+    *cached = Some(manager.clone());
+    Ok(manager)
 }
 
 fn find_session_by_app_id(
     app_id: &str,
 ) -> windows::core::Result<Option<GlobalSystemMediaTransportControlsSession>> {
-    let manager = get_session_manager()?;
+    match find_session_in(&get_session_manager()?, app_id) {
+        // The cached manager stops working if the service restarted, so reconnect once.
+        Err(_) => {
+            *SESSION_MANAGER.lock().unwrap() = None;
+            find_session_in(&get_session_manager()?, app_id)
+        }
+        result => result,
+    }
+}
+
+fn find_session_in(
+    manager: &GlobalSystemMediaTransportControlsSessionManager,
+    app_id: &str,
+) -> windows::core::Result<Option<GlobalSystemMediaTransportControlsSession>> {
     let sessions = manager.GetSessions()?;
     let size = sessions.Size()?;
 
@@ -259,11 +289,19 @@ async fn refresh_cached_prioritized_media(source: &PlatformMediaSource) -> std::
         .unwrap_or_else(MediaInfo::empty);
 
     // Mark healthy under the lock so a fallback result can't overwrite this one.
-    if let Ok(mut latest) = latest_media_store().write() {
-        SESSION_SERVICE_HEALTHY.store(true, Ordering::Release);
-        *latest = best;
+    let changed = match latest_media_store().write() {
+        Ok(mut latest) => {
+            SESSION_SERVICE_HEALTHY.store(true, Ordering::Release);
+            let changed = *latest != best;
+            *latest = best;
+            changed
+        }
+        Err(_) => false,
+    };
+    // Only wake the GUI when something it shows actually changed.
+    if changed {
+        mark_media_update_pending();
     }
-    mark_media_update_pending();
 
     Ok(())
 }
@@ -331,6 +369,7 @@ pub async fn run_media_controller() {
         };
 
         SESSION_SERVICE_HEALTHY.store(false, Ordering::Release);
+        fallback::wake();
         match &error {
             ControllerError::Unresponsive(message) => {
                 eprintln!("Media session service unresponsive: {message}");

@@ -1,42 +1,69 @@
-use eframe::egui::{self};
 use std::mem::size_of;
-use windows::core::{PCWSTR};
-use windows::Win32::Foundation::{HWND, POINT, RECT as WinRECT};
+use std::sync::atomic::{AtomicIsize, Ordering};
+use windows::core::{PCWSTR, w};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT as WinRECT, WPARAM};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetForegroundWindow, GWL_EXSTYLE, GetCursorPos, GetWindowLongW, GetWindowRect,
+    FindWindowExW, FindWindowW, GW_HWNDPREV, GetForegroundWindow, GWL_EXSTYLE, GetWindow, GetWindowLongW,
+    GetWindowRect, GetWindowThreadProcessId, IsWindow,
     HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SetWindowLongW, SetWindowPos, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    STYLESTRUCT, SetWindowLongW, SetWindowPos, WM_STYLECHANGING, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
+static OVERLAY_HWND: AtomicIsize = AtomicIsize::new(0);
+
+// Finds this process's overlay window once and caches it, so frequent checks don't search every window by title.
 fn overlay_hwnd() -> Option<HWND> {
-    let title_utf16: Vec<u16> = "Taskbar Media Info\0".encode_utf16().collect();
-    unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title_utf16.as_ptr())) }.ok()
+    let cached = HWND(OVERLAY_HWND.load(Ordering::Acquire) as *mut _);
+    if !cached.0.is_null() && unsafe { IsWindow(Some(cached)) }.as_bool() {
+        return Some(cached);
+    }
+
+    let own_pid = unsafe { GetCurrentProcessId() };
+    let mut previous: Option<HWND> = None;
+    loop {
+        let hwnd = unsafe { FindWindowExW(None, previous, PCWSTR::null(), w!("Taskbar Media Info")) }.ok()?;
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid == own_pid {
+            OVERLAY_HWND.store(hwnd.0 as isize, Ordering::Release);
+            return Some(hwnd);
+        }
+        previous = Some(hwnd);
+    }
 }
 
-// Returns true if the OS cursor is currently over any of the given egui rects (in logical pixels).
-// Uses Win32 GetCursorPos so it works even when MousePassthrough is active.
-pub fn cursor_over_rects(rects: &[egui::Rect], pixels_per_point: f32) -> bool {
-    let Some(hwnd) = overlay_hwnd() else {
+// Returns the overlay's bounds in physical screen pixels.
+pub fn overlay_window_rect() -> Option<WinRECT> {
+    let hwnd = overlay_hwnd()?;
+    let mut rect = WinRECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
+    Some(rect)
+}
+
+// Returns true if the taskbar sits above the overlay in the z-order, which only takes a walk over the few windows above it.
+pub fn overlay_below_taskbar() -> bool {
+    let Some(overlay) = overlay_hwnd() else {
         return false;
     };
-    let mut cursor = POINT::default();
-    if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+    let Ok(taskbar) = (unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }) else {
         return false;
+    };
+
+    let mut current = overlay;
+    while let Ok(above) = unsafe { GetWindow(current, GW_HWNDPREV) } {
+        if above == taskbar {
+            return true;
+        }
+        current = above;
     }
-    let mut win_rect = WinRECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut win_rect) }.is_err() {
-        return false;
-    }
-    // Convert physical screen coords → window-local logical pixels
-    let lx = (cursor.x - win_rect.left) as f32 / pixels_per_point;
-    let ly = (cursor.y - win_rect.top) as f32 / pixels_per_point;
-    let local_pos = egui::pos2(lx, ly);
-    rects.iter().any(|r| r.contains(local_pos))
+    false
 }
 
 // Pins an overlay window to the topmost z-order to ensure it stays above the taskbar and other windows
@@ -56,14 +83,42 @@ pub fn pin_overlay_topmost() {
     }
 }
 
+fn with_tool_window_style(ex_style: u32) -> u32 {
+    (ex_style | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) & !WS_EX_APPWINDOW.0
+}
+
+// Keeps the overlay a tool window for good, so it stays out of the taskbar and Alt-Tab. winit rewrites the whole
+// extended style whenever it changes a window flag such as mouse passthrough, so the style is corrected while it is
+// being changed. Must be called on the thread that owns the window.
+pub fn keep_overlay_out_of_task_switchers() {
+    let Some(hwnd) = overlay_hwnd() else {
+        return;
+    };
+    if unsafe { SetWindowSubclass(hwnd, Some(enforce_tool_window_style), 1, 0) }.as_bool() {
+        hide_overlay_from_task_switchers();
+    }
+}
+
+unsafe extern "system" fn enforce_tool_window_style(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if msg == WM_STYLECHANGING && wparam.0 as i32 == GWL_EXSTYLE.0 {
+        let style = unsafe { &mut *(lparam.0 as *mut STYLESTRUCT) };
+        style.styleNew = with_tool_window_style(style.styleNew);
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
 // Convert the window to a Windows tool window so it is hidden from taskbar and Alt-Tab.
-pub fn hide_overlay_from_task_switchers() {
+fn hide_overlay_from_task_switchers() {
     if let Some(hwnd) = overlay_hwnd() {
         let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
-        let mut new_style = ex_style as u32;
-        new_style |= WS_EX_TOOLWINDOW.0 as u32;
-        new_style |= WS_EX_NOACTIVATE.0 as u32;
-        new_style &= !(WS_EX_APPWINDOW.0 as u32);
+        let new_style = with_tool_window_style(ex_style as u32);
 
         if new_style != ex_style as u32 {
             let _ = unsafe { SetWindowLongW(hwnd, GWL_EXSTYLE, new_style as i32) };
